@@ -1,0 +1,938 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no">
+<title>Coin Catcher</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #0b1020;
+    font-family: system-ui, sans-serif; color: #fff; touch-action: none; user-select: none; }
+  canvas { display: block; }
+  #hud { position: fixed; top: 0; left: 0; right: 0; display: flex; justify-content: space-between;
+    align-items: center; padding: 12px 16px; font-weight: 600; text-shadow: 0 1px 3px #000; pointer-events: none; }
+  #combo { position: fixed; top: 48px; left: 0; right: 0; text-align: center; font-weight: 800;
+    font-size: 20px; color: #facc15; text-shadow: 0 2px 6px #000; pointer-events: none; min-height: 26px; }
+  #combo.pulse { animation: pulse .25s ease-out; }
+  @keyframes pulse { from { transform: scale(1.35); } to { transform: scale(1); } }
+  #controls { position: fixed; bottom: 16px; right: 16px; display: flex; gap: 8px; }
+  #controls button { font-size: 13px; padding: 8px 12px; margin: 0; background: rgba(59,130,246,.85); }
+  #overlay { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center;
+    background: rgba(5, 8, 20, .6); text-align: center; padding: 24px; overflow-y: auto; box-sizing: border-box; }
+  #ovInner { margin: auto; display: flex; flex-direction: column; align-items: center; }
+  #overlay h1 { margin: 0 0 8px; font-size: 36px; }
+  #overlay p { margin: 4px 0; opacity: .9; max-width: 420px; }
+  #whoMsg { font-weight: 700; color: #d8fd71; opacity: 1 !important; }
+  #saveMsg { font-weight: 700; color: #67e8f9; opacity: 1 !important; }
+  #boardBox { margin-top: 18px; min-width: 260px; max-width: 360px; background: rgba(255,255,255,.07);
+    border-radius: 12px; padding: 10px 16px; text-align: left; }
+  #boardBox h3 { margin: 0 0 6px; font-size: 15px; text-align: center; }
+  #board { margin: 0; padding-left: 22px; font-size: 14px; line-height: 1.6; }
+  #board li.me { color: #d8fd71; font-weight: 700; }
+  button { font-size: 18px; padding: 12px 28px; border: 0; border-radius: 10px; background: #3b82f6;
+    color: #fff; cursor: pointer; margin-top: 16px; }
+  button.secondary { background: #d8fd71; color: #111; font-size: 15px; font-weight: 700; margin-top: 10px; }
+  button:active { transform: scale(.97); }
+  .hidden { display: none !important; }
+  .popup { position: fixed; transform: translate(-50%, -50%); font-weight: 800; font-size: 22px;
+    color: #facc15; text-shadow: 0 2px 4px #000; pointer-events: none; animation: floatUp .8s ease-out forwards; }
+  .popup.bad { color: #f87171; }
+  .popup.gem { color: #67e8f9; }
+  @keyframes floatUp { from { opacity: 1; margin-top: 0; } to { opacity: 0; margin-top: -70px; } }
+</style>
+</head>
+<body>
+
+<div id="hud">
+  <div>Player: <span id="hudName">...</span></div>
+  <div>Score: <span id="hudScore">0</span></div>
+  <div>Lives: <span id="hudLives">3</span></div>
+  <div>Best: <span id="hudBest">0</span></div>
+</div>
+<div id="combo"></div>
+
+<div id="controls">
+  <button id="muteBtn">Sound: on</button>
+</div>
+
+<div id="overlay">
+  <div id="ovInner">
+    <h1 id="ovTitle">Coin Catcher</h1>
+    <p id="whoMsg">Looking for your start.ng character...</p>
+    <p id="ovMsg">Catch the gold coins. Dodge the red bombs. Grab cyan gems for +50 and an extra life.</p>
+    <p id="saveMsg" class="hidden"></p>
+    <p>Catch coins without missing to build a combo and multiply your points.</p>
+    <p>Move: arrow keys / A and D, or drag on the screen. M = mute.</p>
+    <button id="playBtn">Start</button>
+    <button id="signinBtn" class="secondary hidden">Sign in with start.ng</button>
+    <div id="boardBox" class="hidden">
+      <h3>Leaderboard</h3>
+      <ol id="board"></ol>
+    </div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": { "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js" } }
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+
+/* =====================================================================
+   START.NG  (players, characters, scores, leaderboard)
+   ---------------------------------------------------------------------
+   start.ng is our backend. We talk to it through a hidden page,
+   https://start.ng/connect, using the browser's postMessage.
+   This only works once the game is live at <name>.start.ng. When you
+   open the file on your own computer there is no player, so the game
+   falls back to a default "Guest" character and still plays fine.
+   ===================================================================== */
+const START_NG = 'https://start.ng';
+let frame;
+
+function connectFrame() {
+  frame ??= new Promise((resolve, reject) => {
+    const el = document.createElement('iframe');
+    el.src = `${START_NG}/connect`;
+    el.hidden = true;
+    el.onload = () => resolve(el);
+    el.onerror = reject;
+    document.body.append(el);
+  });
+  return frame;
+}
+
+// Sends a message and resolves to start.ng's reply, or null if it didn't answer.
+async function askStartNg(message, replyType, timeoutMs = 5000) {
+  let el;
+  try {
+    el = await Promise.race([
+      connectFrame(),
+      new Promise((resolve) => setTimeout(() => resolve(null), timeoutMs)),
+    ]);
+  } catch (e) { el = null; }
+  if (!el) return null;
+  return new Promise((resolve) => {
+    const requestId = Math.random().toString(36).slice(2);
+    const done = (reply) => { clearTimeout(timer); removeEventListener('message', onMessage); resolve(reply); };
+    const timer = setTimeout(() => done(null), timeoutMs);
+    function onMessage(e) {
+      if (e.origin !== START_NG || e.source !== el.contentWindow) return; // only trust start.ng
+      if (e.data?.type === replyType && e.data.requestId === requestId) done(e.data);
+    }
+    addEventListener('message', onMessage);
+    el.contentWindow.postMessage({ ...message, requestId }, START_NG);
+  });
+}
+
+// The look used when start.ng can't be reached (for example on your own computer)
+const FALLBACK_PLAYER = {
+  name: 'Guest',
+  style: { body: 'male', primaryColor: '#3b82f6', secondaryColor: '#1e293b', skinColor: '#8d5524',
+           hairColor: '#17120f', hair: 'short', hat: 'none', accessory: 'none' },
+};
+
+const isGuestLink = new URLSearchParams(location.search).has('guest');
+
+const StartNG = {
+  // Who is playing? Returns { user, player } or null if start.ng didn't answer.
+  // user   = the signed-in player (or null for a guest)
+  // player = who to draw: the signed-in player, or start.ng's guest
+  async whoami() {
+    const reply = await askStartNg({ type: 'startng:whoami' }, 'startng:user', 3500);
+    if (!reply) return null;
+    const user = reply.user ?? null;
+    return { user, player: user ?? reply.guest ?? null };
+  },
+  signIn() {
+    location.href = `${START_NG}/?return_to=${encodeURIComponent(location.origin + location.pathname)}`;
+  },
+  // Save a finished run. Only whole numbers are allowed.
+  async saveRun(stats) {
+    const clean = {};
+    for (const k in stats) clean[k] = Math.max(0, Math.min(1e9, Math.round(stats[k])));
+    return askStartNg({ type: 'startng:score', stats: clean }, 'startng:scoreSaved');
+  },
+  async leaderboard(limit = 5) {
+    const reply = await askStartNg({ type: 'startng:leaderboard', limit }, 'startng:leaderboardData');
+    return reply?.ok ? reply.entries : null;
+  },
+};
+
+/* =====================================================================
+   SOUND: every sound is generated with the Web Audio API (no files).
+   Browsers only allow audio after a click/tap, so init() is called
+   from the Start button.
+   ===================================================================== */
+const Sound = {
+  ctx: null,
+  master: null,
+  muted: false,
+  musicTimer: null,
+
+  init() {
+    if (this.ctx) {
+      if (this.ctx.state === 'suspended') this.ctx.resume();
+      return;
+    }
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return;
+    this.ctx = new AC();
+    this.master = this.ctx.createGain();
+    this.master.gain.value = this.muted ? 0 : 0.5;
+    this.master.connect(this.ctx.destination);
+  },
+
+  setMuted(m) {
+    this.muted = m;
+    if (this.master) this.master.gain.value = m ? 0 : 0.5;
+  },
+
+  // One musical note: oscillator -> volume envelope -> master
+  tone(freq, dur, opts = {}) {
+    if (!this.ctx) return;
+    const { type = 'sine', vol = 0.25, slide = 0, delay = 0 } = opts;
+    const t = this.ctx.currentTime + delay;
+    const osc = this.ctx.createOscillator();
+    const gain = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t);
+    if (slide) osc.frequency.exponentialRampToValueAtTime(Math.max(freq + slide, 20), t + dur);
+    gain.gain.setValueAtTime(0.0001, t);
+    gain.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    osc.connect(gain);
+    gain.connect(this.master);
+    osc.start(t);
+    osc.stop(t + dur + 0.05);
+  },
+
+  // A burst of filtered static: used for the bomb explosion
+  noise(dur, vol, cutoff) {
+    if (!this.ctx) return;
+    const n = Math.floor(this.ctx.sampleRate * dur);
+    const buf = this.ctx.createBuffer(1, n, this.ctx.sampleRate);
+    const data = buf.getChannelData(0);
+    for (let i = 0; i < n; i++) data[i] = Math.random() * 2 - 1;
+    const src = this.ctx.createBufferSource();
+    src.buffer = buf;
+    const filter = this.ctx.createBiquadFilter();
+    filter.type = 'lowpass';
+    filter.frequency.value = cutoff;
+    const gain = this.ctx.createGain();
+    const t = this.ctx.currentTime;
+    gain.gain.setValueAtTime(vol, t);
+    gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
+    src.connect(filter);
+    filter.connect(gain);
+    gain.connect(this.master);
+    src.start(t);
+  },
+
+  // Coin: two quick notes. The pitch climbs with your combo.
+  coin(combo) {
+    const base = 880 * Math.pow(1.0595, Math.min(combo, 12));
+    this.tone(base, 0.09, { type: 'square', vol: 0.14 });
+    this.tone(base * 1.5, 0.2, { type: 'square', vol: 0.14, delay: 0.07 });
+  },
+  gem() {
+    [523.25, 659.25, 783.99, 1046.5, 1318.5].forEach((f, i) =>
+      this.tone(f, 0.18, { type: 'triangle', vol: 0.25, delay: i * 0.06 }));
+  },
+  bomb() {
+    this.noise(0.55, 0.7, 900);
+    this.tone(140, 0.45, { type: 'sawtooth', vol: 0.35, slide: -110 });
+  },
+  over() {
+    [392, 349.23, 293.66, 196].forEach((f, i) =>
+      this.tone(f, 0.3, { type: 'triangle', vol: 0.3, delay: i * 0.18 }));
+  },
+  start() {
+    [392, 523.25, 659.25, 783.99].forEach((f, i) =>
+      this.tone(f, 0.14, { type: 'square', vol: 0.16, delay: i * 0.07 }));
+  },
+
+  // Simple looping bass + melody (A minor), stepped by a timer
+  startMusic() {
+    if (!this.ctx || this.musicTimer) return;
+    const bass = [110, 110, 130.81, 130.81, 146.83, 146.83, 98, 98];
+    const lead = [440, 0, 523.25, 0, 659.25, 523.25, 587.33, 0,
+                  440, 0, 523.25, 659.25, 783.99, 659.25, 587.33, 523.25];
+    let step = 0;
+    this.musicTimer = setInterval(() => {
+      if (!this.muted) {
+        if (step % 2 === 0) this.tone(bass[(step >> 1) % bass.length], 0.3, { type: 'triangle', vol: 0.12 });
+        const n = lead[step % lead.length];
+        if (n) this.tone(n, 0.14, { type: 'square', vol: 0.035 });
+      }
+      step++;
+    }, 170);
+  },
+  stopMusic() {
+    clearInterval(this.musicTimer);
+    this.musicTimer = null;
+  },
+};
+
+/* =====================================================================
+   THREE.JS SETUP: scene, camera, renderer, lights
+   ===================================================================== */
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0b1020);
+scene.fog = new THREE.Fog(0x0b1020, 15, 45);
+
+const camera = new THREE.PerspectiveCamera(60, innerWidth / innerHeight, 0.1, 100);
+const camBase = new THREE.Vector3(); // resting camera position (shake moves it away and back)
+const renderer = new THREE.WebGLRenderer({ antialias: true });
+renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+renderer.setSize(innerWidth, innerHeight);
+document.body.prepend(renderer.domElement);
+
+scene.add(new THREE.AmbientLight(0xffffff, 0.7));
+const sun = new THREE.DirectionalLight(0xffffff, 1.2);
+sun.position.set(4, 10, 8);
+scene.add(sun);
+
+// Ground
+const ground = new THREE.Mesh(
+  new THREE.BoxGeometry(14, 0.4, 14),
+  new THREE.MeshStandardMaterial({ color: 0x1e293b })
+);
+ground.position.set(0, -0.2, 0);
+scene.add(ground);
+scene.add(new THREE.GridHelper(14, 14, 0x334155, 0x334155));
+
+// Stars in the background
+const starPos = [];
+for (let i = 0; i < 400; i++) {
+  starPos.push((Math.random() - 0.5) * 70, Math.random() * 30 + 2, -12 - Math.random() * 20);
+}
+const starGeo = new THREE.BufferGeometry();
+starGeo.setAttribute('position', new THREE.Float32BufferAttribute(starPos, 3));
+const starMat = new THREE.PointsMaterial({ color: 0xffffff, size: 0.18, transparent: true, fog: false });
+scene.add(new THREE.Points(starGeo, starMat));
+
+const LIMIT = 5.5; // how far left/right the player can go
+
+function resize() {
+  camera.aspect = innerWidth / innerHeight;
+  // On tall phone screens, pull the camera back so the whole play area still fits
+  const needHalfWidth = 6.5;
+  const dist = Math.max(10, needHalfWidth / (Math.tan(THREE.MathUtils.degToRad(30)) * camera.aspect));
+  camera.position.set(0, 4 + (dist - 10) * 0.3, dist);
+  camBase.copy(camera.position);
+  camera.lookAt(0, 3.2, 0);
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth, innerHeight);
+}
+addEventListener('resize', resize);
+resize();
+
+/* =====================================================================
+   THE CHARACTER
+   ---------------------------------------------------------------------
+   Built from simple boxes, like the characters on start.ng. Its look
+   comes from the player's start.ng "style":
+     body            female | male
+     primaryColor    top (shirt)
+     secondaryColor  trousers / skirt (and hats, scarf, backpack)
+     skinColor, hairColor
+     hair            short afro braids bun ponytail dreads bald
+     hat             none cap beanie tophat crown
+     accessory       none glasses earrings beard scarf backpack
+   ===================================================================== */
+const skinMat      = new THREE.MeshStandardMaterial({ color: 0x8d5524 });
+const primaryMat   = new THREE.MeshStandardMaterial({ color: 0x3b82f6 });
+const secondaryMat = new THREE.MeshStandardMaterial({ color: 0x1e293b });
+const hairMat      = new THREE.MeshStandardMaterial({ color: 0x17120f });
+const darkMat      = new THREE.MeshStandardMaterial({ color: 0x111111 });
+const glassMat     = new THREE.MeshStandardMaterial({ color: 0x111111, transparent: true, opacity: 0.55 });
+const goldMat      = new THREE.MeshStandardMaterial({ color: 0xfacc15, metalness: 0.7, roughness: 0.3 });
+const goldOpenMat  = goldMat.clone();
+goldOpenMat.side = THREE.DoubleSide;
+
+function box(w, h, d, mat, x = 0, y = 0, z = 0) {
+  const m = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), mat);
+  m.position.set(x, y, z);
+  return m;
+}
+function clearGroup(g) {
+  while (g.children.length) {
+    const c = g.children[0];
+    g.remove(c);
+    c.geometry?.dispose();
+  }
+}
+
+const player = new THREE.Group();   // moves left/right, spins on the menu
+const rig = new THREE.Group();      // the character itself (bobs up and down)
+player.add(rig);
+const BASE_SCALE = 1.1;
+const BASE = new THREE.Vector3(BASE_SCALE, BASE_SCALE, BASE_SCALE);
+player.scale.copy(BASE);
+
+// Legs and arms hang from "pivots" so they can swing from the hip / shoulder
+const legL = new THREE.Group(); legL.position.set(-0.18, 0.8, 0); legL.add(box(0.28, 0.8, 0.28, secondaryMat, 0, -0.4, 0));
+const legR = new THREE.Group(); legR.position.set(0.18, 0.8, 0);  legR.add(box(0.28, 0.8, 0.28, secondaryMat, 0, -0.4, 0));
+const torso = box(0.75, 0.85, 0.45, primaryMat, 0, 1.225, 0);
+const skirt = box(0.82, 0.32, 0.52, secondaryMat, 0, 0.74, 0);
+const armL = new THREE.Group(); armL.position.set(-0.5, 1.6, 0);
+armL.add(box(0.22, 0.7, 0.22, primaryMat, 0, -0.35, 0), box(0.2, 0.2, 0.2, skinMat, 0, -0.8, 0));
+const armR = new THREE.Group(); armR.position.set(0.5, 1.6, 0);
+armR.add(box(0.22, 0.7, 0.22, primaryMat, 0, -0.35, 0), box(0.2, 0.2, 0.2, skinMat, 0, -0.8, 0));
+
+const head = new THREE.Group();
+head.position.y = 1.95;
+head.add(box(0.6, 0.6, 0.6, skinMat));
+head.add(box(0.1, 0.12, 0.02, darkMat, -0.13, 0.05, 0.305));
+head.add(box(0.1, 0.12, 0.02, darkMat, 0.13, 0.05, 0.305));
+const hairGroup = new THREE.Group(); head.add(hairGroup);
+const hatGroup = new THREE.Group();  head.add(hatGroup);
+const accGroup = new THREE.Group();  // accessories attached to the body
+
+rig.add(legL, legR, torso, skirt, armL, armR, head, accGroup);
+scene.add(player);
+
+// Glowing ring on the floor that follows the player (takes the shirt colour)
+const ringMat = new THREE.MeshBasicMaterial({ color: 0x3b82f6, transparent: true, opacity: 0.55, side: THREE.DoubleSide });
+const ring = new THREE.Mesh(new THREE.RingGeometry(0.85, 1.1, 32), ringMat);
+ring.rotation.x = -Math.PI / 2;
+ring.position.y = 0.03;
+scene.add(ring);
+
+function buildHair(kind) {
+  clearGroup(hairGroup);
+  if (kind === 'bald') return;
+  const g = hairGroup;
+  const topCap = () => {
+    g.add(box(0.64, 0.12, 0.64, hairMat, 0, 0.34, 0));
+    g.add(box(0.64, 0.3, 0.08, hairMat, 0, 0.15, -0.28));
+  };
+  if (kind === 'afro') {
+    const puff = new THREE.Mesh(new THREE.SphereGeometry(0.42, 20, 16), hairMat);
+    puff.scale.y = 0.9;
+    puff.position.set(0, 0.28, -0.1);
+    g.add(puff);
+  } else if (kind === 'braids') {
+    topCap();
+    for (let i = 0; i < 5; i++) g.add(box(0.08, 0.75, 0.08, hairMat, -0.24 + i * 0.12, -0.2, -0.32));
+  } else if (kind === 'bun') {
+    topCap();
+    const bun = new THREE.Mesh(new THREE.SphereGeometry(0.17, 14, 12), hairMat);
+    bun.position.set(0, 0.5, -0.15);
+    g.add(bun);
+  } else if (kind === 'ponytail') {
+    topCap();
+    const tail = box(0.14, 0.55, 0.14, hairMat, 0, 0.0, -0.42);
+    tail.rotation.x = -0.35;
+    g.add(tail, box(0.17, 0.17, 0.17, primaryMat, 0, 0.22, -0.34));
+  } else if (kind === 'dreads') {
+    topCap();
+    for (let i = 0; i < 9; i++) {
+      const a = Math.PI * (0.55 + (0.9 * i) / 8); // sides and back, never the front
+      const d = new THREE.Mesh(new THREE.CylinderGeometry(0.045, 0.045, 0.65, 8), hairMat);
+      d.position.set(Math.sin(a) * 0.33, -0.05, Math.cos(a) * 0.33);
+      g.add(d);
+    }
+  } else {
+    topCap(); // "short" (also the default for anything unknown)
+  }
+}
+
+function buildHat(kind, hair) {
+  clearGroup(hatGroup);
+  if (kind === 'none') return;
+  hatGroup.position.y = 0.3 + (hair === 'afro' ? 0.3 : hair === 'bald' ? 0 : 0.08);
+  const g = hatGroup;
+  if (kind === 'cap') {
+    g.add(box(0.64, 0.2, 0.64, secondaryMat, 0, 0.1, 0));
+    g.add(box(0.56, 0.05, 0.32, secondaryMat, 0, 0.02, 0.42));
+  } else if (kind === 'beanie') {
+    g.add(box(0.66, 0.32, 0.66, secondaryMat, 0, 0.14, 0));
+    const pom = new THREE.Mesh(new THREE.SphereGeometry(0.12, 12, 10), primaryMat);
+    pom.position.y = 0.38;
+    g.add(pom);
+  } else if (kind === 'tophat') {
+    g.add(new THREE.Mesh(new THREE.CylinderGeometry(0.45, 0.45, 0.04, 20), secondaryMat));
+    const crown = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.28, 0.55, 20), secondaryMat);
+    crown.position.y = 0.3;
+    const band = new THREE.Mesh(new THREE.CylinderGeometry(0.29, 0.29, 0.08, 20), primaryMat);
+    band.position.y = 0.1;
+    g.add(crown, band);
+  } else if (kind === 'crown') {
+    const band = new THREE.Mesh(new THREE.CylinderGeometry(0.36, 0.32, 0.22, 16, 1, true), goldOpenMat);
+    band.position.y = 0.11;
+    g.add(band);
+    for (let i = 0; i < 5; i++) {
+      const a = (i / 5) * Math.PI * 2;
+      const spike = new THREE.Mesh(new THREE.ConeGeometry(0.07, 0.18, 8), goldMat);
+      spike.position.set(Math.cos(a) * 0.34, 0.31, Math.sin(a) * 0.34);
+      g.add(spike);
+    }
+  }
+}
+
+function buildAccessory(kind) {
+  clearGroup(accGroup);
+  const g = accGroup;
+  if (kind === 'earrings') {
+    [-1, 1].forEach(s => {
+      const e = new THREE.Mesh(new THREE.SphereGeometry(0.05, 10, 8), goldMat);
+      e.position.set(s * 0.32, 1.84, 0);
+      g.add(e);
+    });
+  } else if (kind === 'beard') {
+    g.add(box(0.52, 0.22, 0.08, hairMat, 0, 1.76, 0.28));
+  } else if (kind === 'glasses') {
+    g.add(box(0.2, 0.14, 0.03, glassMat, -0.15, 2.0, 0.32));
+    g.add(box(0.2, 0.14, 0.03, glassMat, 0.15, 2.0, 0.32));
+    g.add(box(0.1, 0.03, 0.03, darkMat, 0, 2.02, 0.32));
+  } else if (kind === 'scarf') {
+    g.add(box(0.7, 0.16, 0.5, secondaryMat, 0, 1.66, 0));
+    g.add(box(0.16, 0.45, 0.1, secondaryMat, 0.22, 1.42, 0.27));
+  } else if (kind === 'backpack') {
+    g.add(box(0.56, 0.62, 0.26, secondaryMat, 0, 1.25, -0.36));
+    g.add(box(0.58, 0.14, 0.28, primaryMat, 0, 1.52, -0.36));
+  }
+}
+
+const HAIRS = ['short', 'afro', 'braids', 'bun', 'ponytail', 'dreads', 'bald'];
+const HATS = ['none', 'cap', 'beanie', 'tophat', 'crown'];
+const ACCESSORIES = ['none', 'glasses', 'earrings', 'beard', 'scarf', 'backpack'];
+const isColor = c => typeof c === 'string' && /^#[0-9a-f]{6}$/i.test(c);
+
+let lookKey = '';
+// Dress the character in a start.ng style. Unknown or missing values fall back to something sensible.
+function applyStyle(style) {
+  const s = style || FALLBACK_PLAYER.style;
+  const f = FALLBACK_PLAYER.style;
+  const body = s.body === 'female' ? 'female' : 'male';
+  const hair = HAIRS.includes(s.hair) ? s.hair : 'short';
+  const hat = HATS.includes(s.hat) ? s.hat : 'none';
+  const acc = ACCESSORIES.includes(s.accessory) ? s.accessory : 'none';
+
+  primaryMat.color.set(isColor(s.primaryColor) ? s.primaryColor : f.primaryColor);
+  secondaryMat.color.set(isColor(s.secondaryColor) ? s.secondaryColor : f.secondaryColor);
+  skinMat.color.set(isColor(s.skinColor) ? s.skinColor : f.skinColor);
+  hairMat.color.set(isColor(s.hairColor) ? s.hairColor : f.hairColor);
+  ringMat.color.copy(primaryMat.color);
+
+  skirt.visible = body === 'female';
+  torso.scale.x = body === 'female' ? 0.9 : 1;
+  armL.position.x = body === 'female' ? -0.47 : -0.5;
+  armR.position.x = body === 'female' ? 0.47 : 0.5;
+
+  const key = [hair, hat, acc].join('|');
+  if (key !== lookKey) {
+    lookKey = key;
+    buildHair(hair);
+    buildHat(hat, hair);
+    buildAccessory(acc);
+  }
+}
+applyStyle(FALLBACK_PLAYER.style);
+
+// Swing the legs and arms while moving, breathe while still, wave both arms after a catch
+let celebrate = 0;
+function animateCharacter(time, dt, moveAmt) {
+  const swing = Math.sin(time * 14) * moveAmt;
+  legL.rotation.x = swing * 0.9;
+  legR.rotation.x = -swing * 0.9;
+  if (celebrate > 0) {
+    celebrate -= dt;
+    armL.rotation.x = armR.rotation.x = -2.6 + Math.sin(time * 30) * 0.12;
+  } else {
+    const sway = Math.sin(time * 2) * 0.05 * (1 - moveAmt);
+    armL.rotation.x = -swing * 0.8 + sway;
+    armR.rotation.x = swing * 0.8 - sway;
+  }
+  rig.position.y = Math.abs(swing) * 0.08 + Math.sin(time * 2) * 0.015 * (1 - moveAmt);
+}
+
+/* =====================================================================
+   FALLING ITEMS: coins (good), gems (great), bombs (bad)
+   ===================================================================== */
+const coinGeo = new THREE.CylinderGeometry(0.4, 0.4, 0.12, 20);
+coinGeo.rotateX(Math.PI / 2); // face the camera, spins like a real coin
+const coinMat = new THREE.MeshStandardMaterial({ color: 0xfacc15, metalness: 0.6, roughness: 0.3, emissive: 0x7a5d00, emissiveIntensity: 0.5 });
+const bombGeo = new THREE.SphereGeometry(0.45, 16, 16);
+const bombMat = new THREE.MeshStandardMaterial({ color: 0x7f1d1d, emissive: 0xdc2626, emissiveIntensity: 0.6 });
+const gemGeo = new THREE.OctahedronGeometry(0.5);
+const gemMat = new THREE.MeshStandardMaterial({ color: 0x22d3ee, emissive: 0x0891b2, emissiveIntensity: 0.9, metalness: 0.3, roughness: 0.2 });
+
+let items = [];
+function spawnItem() {
+  const r = Math.random();
+  const kind = r < 0.22 ? 'bomb' : r < 0.28 ? 'gem' : 'coin';
+  const geo = kind === 'bomb' ? bombGeo : kind === 'gem' ? gemGeo : coinGeo;
+  const mat = kind === 'bomb' ? bombMat : kind === 'gem' ? gemMat : coinMat;
+  const mesh = new THREE.Mesh(geo, mat);
+  mesh.position.set((Math.random() * 2 - 1) * LIMIT, 10, 0);
+  mesh.scale.setScalar(1.25);
+  scene.add(mesh);
+  items.push({ mesh, kind });
+}
+
+/* =====================================================================
+   PARTICLES (little shards that burst out and shrink away)
+   ===================================================================== */
+const partGeo = new THREE.TetrahedronGeometry(0.13);
+const partMats = {
+  gold: new THREE.MeshBasicMaterial({ color: 0xfacc15 }),
+  red:  new THREE.MeshBasicMaterial({ color: 0xf87171 }),
+  cyan: new THREE.MeshBasicMaterial({ color: 0x67e8f9 }),
+};
+let particles = [];
+
+function burst(pos, colorKey, count, speed) {
+  for (let i = 0; i < count; i++) {
+    const mesh = new THREE.Mesh(partGeo, partMats[colorKey]);
+    mesh.position.copy(pos);
+    const a = Math.random() * Math.PI * 2;
+    const vel = new THREE.Vector3(
+      Math.cos(a) * speed * Math.random(),
+      (Math.random() * 0.8 + 0.2) * speed,
+      (Math.random() - 0.5) * speed * 0.5
+    );
+    const life = 0.5 + Math.random() * 0.4;
+    scene.add(mesh);
+    particles.push({ mesh, vel, life, max: life });
+  }
+}
+
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.vel.y -= 14 * dt;
+    p.mesh.position.addScaledVector(p.vel, dt);
+    p.mesh.rotation.x += dt * 8;
+    p.mesh.rotation.y += dt * 6;
+    p.life -= dt;
+    p.mesh.scale.setScalar(Math.max(p.life / p.max, 0.001));
+    if (p.life <= 0) {
+      scene.remove(p.mesh);
+      particles.splice(i, 1);
+    }
+  }
+}
+
+// Floating "+10" text, placed over the 3D position on the screen
+function popup(worldPos, text, cls) {
+  const v = worldPos.clone().project(camera);
+  const el = document.createElement('div');
+  el.className = 'popup ' + (cls || '');
+  el.textContent = text;
+  el.style.left = ((v.x * 0.5 + 0.5) * innerWidth) + 'px';
+  el.style.top = ((-v.y * 0.5 + 0.5) * innerHeight) + 'px';
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 800);
+}
+
+/* =====================================================================
+   INPUT: keyboard + drag/touch
+   ===================================================================== */
+const keys = { left: false, right: false };
+addEventListener('keydown', e => {
+  if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') keys.left = true;
+  if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') keys.right = true;
+});
+addEventListener('keyup', e => {
+  if (e.key === 'ArrowLeft' || e.key === 'a' || e.key === 'A') keys.left = false;
+  if (e.key === 'ArrowRight' || e.key === 'd' || e.key === 'D') keys.right = false;
+});
+
+let targetX = 0;
+function dragTo(e) {
+  if (e.buttons > 0) {
+    targetX = THREE.MathUtils.clamp(((e.clientX / innerWidth) * 2 - 1) * LIMIT * 1.1, -LIMIT, LIMIT);
+  }
+}
+renderer.domElement.addEventListener('pointerdown', dragTo);
+renderer.domElement.addEventListener('pointermove', dragTo);
+
+/* =====================================================================
+   GAME STATE + LOGIC
+   ===================================================================== */
+let state = 'ready'; // ready | playing | over
+let score = 0, lives = 3, spawnTimer = 0, hitFlash = 0, best = 0;
+let combo = 0, maxCombo = 0, shake = 0, runCounter = 0;
+let user = null;                 // signed-in start.ng player, or null
+let currentPlayer = FALLBACK_PLAYER; // who we draw (signed-in player, start.ng guest, or fallback)
+let lastX = 0, moveAmt = 0;
+
+const $ = id => document.getElementById(id);
+const multiplier = () => Math.min(1 + Math.floor(combo / 5), 5);
+const bestKey = () => 'best_' + (user ? user.id : 'guest');
+
+function updateHud() {
+  $('hudScore').textContent = score;
+  $('hudLives').textContent = '❤'.repeat(Math.max(lives, 0)) || '-';
+  $('hudBest').textContent = best;
+}
+
+function updateCombo(pulse) {
+  const el = $('combo');
+  el.textContent = combo >= 2 ? combo + ' in a row  x' + multiplier() : '';
+  if (pulse && combo >= 2) {
+    el.classList.remove('pulse');
+    void el.offsetWidth; // restart the animation
+    el.classList.add('pulse');
+  }
+}
+
+// ---- Showing who is playing, and the leaderboard ----
+function showPlayer() {
+  applyStyle(currentPlayer.style);
+  $('hudName').textContent = currentPlayer.name;
+  if (user) {
+    $('whoMsg').textContent = 'Playing as ' + user.name + (user.account ? ' (@' + user.account + ')' : '');
+  } else {
+    $('whoMsg').textContent = 'Playing as ' + currentPlayer.name + '. Sign in to save your score.';
+  }
+  // Signed-out players get a sign-in button (unless they chose "guest" on start.ng)
+  $('signinBtn').classList.toggle('hidden', !!user || isGuestLink);
+  try { best = Number(localStorage.getItem(bestKey()) || 0); } catch (e) { best = 0; }
+  updateHud();
+}
+
+async function refreshBoard() {
+  const entries = await StartNG.leaderboard(5);
+  const list = $('board');
+  list.replaceChildren();
+  if (!entries || !entries.length) { $('boardBox').classList.add('hidden'); return; }
+  for (const e of entries) {
+    const li = document.createElement('li');
+    const pts = e.stats?.score ?? e.score;
+    li.textContent = e.name + ' – ' + pts + (e.stats?.streak != null ? '  (streak ' + e.stats.streak + ')' : '');
+    if (user && e.player_id === user.id) li.className = 'me';
+    list.appendChild(li);
+  }
+  $('boardBox').classList.remove('hidden');
+}
+
+let loadingPlayer = false;
+async function loadPlayer() {
+  if (loadingPlayer) return;
+  loadingPlayer = true;
+  const who = await StartNG.whoami();
+  loadingPlayer = false;
+  if (!who || !who.player) return; // start.ng didn't answer: keep what we have
+  user = who.user;
+  currentPlayer = who.player;
+  showPlayer();
+  refreshBoard();
+}
+
+function startGame() {
+  runCounter++;
+  Sound.init();
+  Sound.start();
+  Sound.startMusic();
+  items.forEach(it => scene.remove(it.mesh));
+  items = [];
+  score = 0; lives = 3; spawnTimer = 0; hitFlash = 0;
+  combo = 0; maxCombo = 0; shake = 0; celebrate = 0;
+  targetX = 0;
+  player.position.x = 0;
+  lastX = 0; moveAmt = 0;
+  player.rotation.set(0, 0, 0);
+  player.scale.copy(BASE);
+  state = 'playing';
+  $('overlay').classList.add('hidden');
+  updateHud();
+  updateCombo(false);
+}
+
+async function endGame() {
+  state = 'over';
+  const myRun = runCounter;
+  Sound.stopMusic();
+  Sound.over();
+
+  const wasBest = score > best;
+  if (wasBest) {
+    best = score;
+    try { localStorage.setItem(bestKey(), String(best)); } catch (e) {}
+  }
+  updateHud();
+  updateCombo(false);
+
+  $('ovTitle').textContent = wasBest ? 'New best!' : 'Game over';
+  $('ovMsg').textContent = 'You scored ' + score + '. Best streak: ' + maxCombo + '.';
+  const saveMsg = $('saveMsg');
+  saveMsg.classList.remove('hidden');
+  saveMsg.textContent = user ? 'Saving your score...' : 'Sign in with start.ng to save your score to the leaderboard.';
+  $('playBtn').textContent = 'Play again';
+  $('overlay').classList.remove('hidden');
+
+  if (!user) return;
+  const reply = await StartNG.saveRun({ score, streak: maxCombo });
+  if (myRun !== runCounter) return; // they already started another round
+  if (reply?.ok) {
+    const r = reply.result;
+    saveMsg.textContent = r.improved
+      ? 'New personal best! You are #' + r.rank + ' on the leaderboard.'
+      : 'Your best is ' + r.best + '. You are #' + r.rank + ' on the leaderboard.';
+    best = Math.max(best, r.best);
+    updateHud();
+  } else {
+    saveMsg.textContent = reply?.error || 'Could not save your score right now.';
+  }
+  refreshBoard();
+}
+
+function update(dt) {
+  // Move player
+  let dir = 0;
+  if (keys.left) dir -= 1;
+  if (keys.right) dir += 1;
+  if (dir !== 0) targetX += dir * 12 * dt;
+  targetX = THREE.MathUtils.clamp(targetX, -LIMIT, LIMIT);
+  player.position.x += (targetX - player.position.x) * Math.min(1, dt * 15);
+
+  // How fast are we moving? Drives the walking animation and which way we face.
+  const vx = (player.position.x - lastX) / Math.max(dt, 0.001);
+  lastX = player.position.x;
+  moveAmt += (Math.min(1, Math.abs(vx) / 3) - moveAmt) * Math.min(1, dt * 12);
+  const turn = THREE.MathUtils.clamp(vx * 0.07, -0.7, 0.7);
+  player.rotation.y += (turn - player.rotation.y) * Math.min(1, dt * 8);
+
+  // Spawn items (faster as score grows)
+  spawnTimer -= dt;
+  if (spawnTimer <= 0) {
+    spawnItem();
+    spawnTimer = Math.max(0.35, 0.9 - score * 0.0004);
+  }
+
+  // Move items and check collisions
+  const speed = 4 + Math.min(score * 0.005, 6);
+  for (let i = items.length - 1; i >= 0; i--) {
+    const it = items[i];
+    it.mesh.position.y -= speed * dt;
+    if (it.kind === 'coin') it.mesh.rotation.y += dt * 4;
+    if (it.kind === 'gem') { it.mesh.rotation.y += dt * 3; it.mesh.rotation.x += dt * 1.5; }
+
+    const dx = Math.abs(it.mesh.position.x - player.position.x);
+    const y = it.mesh.position.y;
+
+    if (dx < 1.0 && y < 2.9 && y > 0.3) {
+      const hitPos = it.mesh.position.clone();
+
+      if (it.kind === 'bomb') {
+        lives -= 1;
+        hitFlash = 0.25;
+        combo = 0;
+        shake = 0.6;
+        burst(hitPos, 'red', 28, 7);
+        popup(hitPos, 'BOOM', 'bad');
+        Sound.bomb();
+        if (navigator.vibrate) navigator.vibrate(120);
+        player.scale.set(BASE_SCALE * 0.85, BASE_SCALE * 1.2, BASE_SCALE * 0.85);
+        updateCombo(false);
+      } else if (it.kind === 'gem') {
+        score += 50;
+        lives = Math.min(lives + 1, 5);
+        celebrate = 0.5;
+        burst(hitPos, 'cyan', 26, 7);
+        popup(hitPos, '+50  +1 life', 'gem');
+        Sound.gem();
+        player.scale.set(BASE_SCALE * 1.2, BASE_SCALE * 0.82, BASE_SCALE * 1.2);
+      } else {
+        combo += 1;
+        maxCombo = Math.max(maxCombo, combo);
+        const pts = 10 * multiplier();
+        score += pts;
+        celebrate = 0.3;
+        burst(hitPos, 'gold', 14, 5);
+        popup(hitPos, '+' + pts);
+        Sound.coin(combo);
+        player.scale.set(BASE_SCALE * 1.12, BASE_SCALE * 0.9, BASE_SCALE * 1.12);
+        updateCombo(true);
+      }
+
+      scene.remove(it.mesh);
+      items.splice(i, 1);
+      updateHud();
+      if (lives <= 0) { endGame(); return; }
+    } else if (y < -1) {
+      // A missed coin breaks your streak
+      if (it.kind === 'coin' && combo > 0) { combo = 0; updateCombo(false); }
+      scene.remove(it.mesh);
+      items.splice(i, 1);
+    }
+  }
+
+  // Red flash when hit
+  const flash = hitFlash > 0 ? 0xff0000 : 0x000000;
+  if (hitFlash > 0) hitFlash -= dt;
+  primaryMat.emissive.setHex(flash);
+  skinMat.emissive.setHex(flash);
+}
+
+/* =====================================================================
+   MAIN LOOP
+   ===================================================================== */
+const clock = new THREE.Clock();
+function animate() {
+  requestAnimationFrame(animate);
+  const dt = Math.min(clock.getDelta(), 0.05);
+  const t = clock.elapsedTime;
+
+  if (state === 'playing') {
+    update(dt);
+  } else {
+    player.rotation.y += dt; // slow spin on the menu so you can see your whole look
+    moveAmt = 0;
+  }
+  animateCharacter(t, dt, state === 'playing' ? moveAmt : 0);
+
+  updateParticles(dt);
+  player.scale.lerp(BASE, Math.min(1, dt * 10));   // squash back to normal
+  ring.position.x = player.position.x;
+  ring.scale.setScalar(1.25 + Math.sin(t * 4) * 0.07);
+  starMat.opacity = 0.75 + Math.sin(t * 2) * 0.25;
+
+  // Screen shake
+  if (shake > 0) {
+    shake = Math.max(0, shake - dt * 2.5);
+    camera.position.set(
+      camBase.x + (Math.random() - 0.5) * shake,
+      camBase.y + (Math.random() - 0.5) * shake,
+      camBase.z
+    );
+  } else {
+    camera.position.copy(camBase);
+  }
+
+  renderer.render(scene, camera);
+}
+
+/* =====================================================================
+   BOOT
+   ===================================================================== */
+$('playBtn').addEventListener('click', startGame);
+$('signinBtn').addEventListener('click', () => StartNG.signIn());
+
+function toggleMute() {
+  Sound.init();
+  Sound.setMuted(!Sound.muted);
+  $('muteBtn').textContent = Sound.muted ? 'Sound: off' : 'Sound: on';
+  try { localStorage.setItem('muted', Sound.muted ? '1' : '0'); } catch (e) {}
+}
+$('muteBtn').addEventListener('click', toggleMute);
+try { Sound.muted = localStorage.getItem('muted') === '1'; } catch (e) {}
+$('muteBtn').textContent = Sound.muted ? 'Sound: off' : 'Sound: on';
+addEventListener('keydown', e => {
+  if (e.key === 'm' || e.key === 'M') toggleMute();
+});
+
+// The player may sign in or out on start.ng in another tab: check again when they come back
+addEventListener('focus', loadPlayer);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) loadPlayer(); });
+
+showPlayer();   // draw the default look straight away so the game never waits
+animate();
+loadPlayer();   // then ask start.ng who is really playing
+</script>
+</body>
+</html>
